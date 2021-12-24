@@ -1,0 +1,536 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Conditions:
+  CreatePipelineBucket: !Equals [!Ref ExistingPipelineBucket, '']
+
+  CreateDeployBucketAndPolicy: !Equals [!Ref ExistingDeployBucket, '']
+
+  CreateDistributionLogsBucket:
+    !Equals [!Ref ExistingDistributionLogsBucket, '']
+
+  CreateLoadBalancerLogsBucketAndPolicy:
+    !Equals [!Ref ExistingLoadBalancerLogsBucket, '']
+
+Parameters:
+  ExistingPipelineBucket:
+    Type: String
+    Default: ''
+  ExistingDeployBucket:
+    Type: String
+    Default: ''
+  ExistingDistributionLogsBucket:
+    Type: String
+    Default: ''
+  ExistingLoadBalancerLogsBucket:
+    Type: String
+    Default: ''
+
+  Certificate:
+    Type: String
+    Default: ''
+
+  ServiceName:
+    Type: String
+    Default: ''
+
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How many CPU to assign to the container (1024 = 1 CPU)
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How many MB of memory to assign to the container
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: The number of copies of the service task to run
+
+  ImageUrl:
+    Type: String
+    Default: ''
+    Description: The URL of a Docker image that contains the application process that will handle the traffic for this service
+
+  ContainerName:
+    Type: String
+    Default: ''
+
+  ContainerPort:
+    Type: Number
+    Default: 80
+    Description: The port number that the application inside the Docker container is binding to
+
+  VpcCidr:
+    Type: String
+    Default: 10.192.0.0/16
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.192.10.0/24
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.192.11.0/24
+
+Resources:
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        EnvironmentName: !Sub '${AWS::StackName}'
+        VpcCIDR: !Ref VpcCidr
+        PublicSubnet1CIDR: !Ref PublicSubnet1Cidr
+        PublicSubnet2CIDR: !Ref PublicSubnet2Cidr
+      TemplateURL: https://my-site-cloudformation-templates.s3.amazonaws.com/vpc-infrastructure.yml
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:UploadArchive
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:GetBranch
+                  - codecommit:CancelUploadArchive
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                Resource:
+                  - '*'
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /service-role/
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                Resource:
+                  - !If [
+                      CreatePipelineBucket,
+                      !GetAtt PipelineBucket.Arn,
+                      !Ref ExistingPipelineBucket,
+                    ]
+                  - !Join [
+                      '',
+                      [
+                        !If [
+                          CreatePipelineBucket,
+                          !GetAtt PipelineBucket.Arn,
+                          !Ref ExistingPipelineBucket,
+                        ],
+                        '/*',
+                      ],
+                    ]
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - 'arn:aws:s3:::*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - cloudfront:CreateInvalidation
+                Resource:
+                  - '*'
+
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreatePipelineBucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-pipeline-artifacts'
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: true
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: true
+
+  DistributionLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateDistributionLogsBucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-cloudfront-distribution-logs'
+      AccessControl: LogDeliveryWrite
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            ExpirationInDays: 365
+            Status: Enabled
+
+  LoadBalancerLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLoadBalancerLogsBucketAndPolicy
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-load-balancer-logs'
+      AccessControl: LogDeliveryWrite
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            ExpirationInDays: 365
+            Status: Enabled
+
+  LoadBalancerLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateLoadBalancerLogsBucketAndPolicy
+    DeletionPolicy: Retain
+    Properties:
+      Bucket:
+        !If [
+          CreateLoadBalancerLogsBucketAndPolicy,
+          !Ref LoadBalancerLogsBucket,
+          !Ref ExistingLoadBalancerLogsBucket,
+        ]
+      PolicyDocument:
+        Id: MySiteLoadBalancerLogsBucketPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PolicyForWriteOfLoadBalancerLogs
+            Effect: Allow
+            Principal:
+              AWS: 127311923021 # us-east-1
+            Action: s3:PutObject
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !If [
+                    CreateLoadBalancerLogsBucketAndPolicy,
+                    !Ref LoadBalancerLogsBucket,
+                    !Ref ExistingLoadBalancerLogsBucket,
+                  ]
+                - /*
+
+  CloudFrontFunctionSecurityHeaders:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-viewer-response'
+      FunctionConfig:
+        Comment: Adds HTTP security headers to the viewer response
+        Runtime: cloudfront-js-1.0
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+            var response = event.response;
+            var headers = response.headers;
+
+            // Set HTTP security headers
+            // Since JavaScript doesn't allow for hyphens in variable names, we use the dict["key"] notation
+            
+            headers['strict-transport-security'] = { value: 'max-age=63072000; includeSubdomains; preload'};
+            
+            headers['content-security-policy'] = { value: "default-src 'none'; img-src 'self' data:; script-src 'self'; object-src 'none'; connect-src 'self' https://vocabulary.brendandagys.com; manifest-src 'self'; style-src https://*.brendandagys.com *.cloudflare.com 'unsafe-inline'; style-src-elem 'self' https://cdnjs.cloudflare.com https://fonts.googleapis.com 'unsafe-inline'; font-src https://fonts.gstatic.com https://*.cloudflare.com"};
+            
+            headers['x-content-type-options'] = { value: 'nosniff'};
+            headers['x-frame-options'] = {value: 'DENY'};
+            headers['x-xss-protection'] = {value: '1; mode=block'};
+
+            delete headers['x-powered-by'];
+
+            // Return the response to viewers 
+            return response;
+        }
+
+  CloudFrontFunctionCanonicalUrl:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-viewer-request'
+      FunctionConfig:
+        Comment: Converts WWW. URLs to canonical URL
+        Runtime: cloudfront-js-1.0
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            var host = request.headers.host.value;
+            var uri = request.uri; // Is the path after `.com`
+            
+            if (host.includes('www.')) {
+                var response = {
+                    statusCode: 302,
+                    statusDescription: 'Found',
+                    headers: {'location': { value: `https://${host.replace('www.', '')}${uri}` }}
+                };
+            return response;
+            }
+            return request;
+        }
+
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}'
+
+  FargateService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerHttps
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref FargateCluster
+      TaskDefinition: !Ref FargateServiceTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      LoadBalancers:
+        - ContainerName: !Ref ContainerName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref MySiteTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !GetAtt NetworkStack.Outputs.PublicSubnet1
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      EnableECSManagedTags: true
+
+  FargateServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ServiceName
+      NetworkMode: awsvpc
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      ExecutionRoleArn: 'arn:aws:iam::708746137251:role/ecs-task-execution-role'
+      ContainerDefinitions:
+        - Image: !Ref ImageUrl
+          Name: !Ref ContainerName
+          PortMappings:
+            - Protocol: tcp
+              ContainerPort: !Ref ContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref FargateTaskDefinitionLogGroup
+              awslogs-stream-prefix: !Sub 'ecs/${ContainerName}'
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+
+  FargateTaskDefinitionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ServiceName}-task-definition'
+
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} containers Security Group'
+      VpcId: !GetAtt NetworkStack.Outputs.VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  ContainerSecurityGroupInboundRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 85
+      SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      GroupId: !GetAtt ContainerSecurityGroup.GroupId
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub
+        - '${ServiceName}-ALB'
+        - { ServiceName: !Ref ServiceName }
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !GetAtt NetworkStack.Outputs.PublicSubnet1
+        - !GetAtt NetworkStack.Outputs.PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: true
+        - Key: access_logs.s3.bucket
+          Value: !Sub '${AWS::StackName}-load-balancer-logs'
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate Service ALB Security Group
+      VpcId: !GetAtt NetworkStack.Outputs.VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  LoadBalancerSecurityGroupOutboundRule:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 85
+      CidrIp: 0.0.0.0/0
+
+  MySiteTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-target-group'
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      TargetType: ip
+      VpcId: !GetAtt NetworkStack.Outputs.VPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /api/health
+
+  ListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      SslPolicy: ELBSecurityPolicy-2016-08
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref MySiteTargetGroup
+
+  # ListenerHttp:
+  #   Type: AWS::ElasticLoadBalancingV2::Listener
+  #   Properties:
+  #     LoadBalancerArn: !Ref LoadBalancer
+  #     Protocol: HTTP
+  #     Port: 80
+  #     DefaultActions:
+  #       - Type: redirect
+  #         RedirectConfig:
+  #           Protocol: HTTPS
+  #           Port: 443
+  #           Host: '#{host}'
+  #           Path: '/#{path}'
+  #           Query: '#{query}'
+  #           StatusCode: 'HTTP_301'
+
+Outputs:
+  Certificate:
+    Value: !Ref Certificate
+    Export:
+      Name: !Sub '${AWS::StackName}-certificate'
+
+  CloudFrontFunctionCanonicalUrl:
+    Value: !Ref CloudFrontFunctionCanonicalUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudfront-function-canonical-url'
+
+  CloudFrontFunctionSecurityHeaders:
+    Value: !Ref CloudFrontFunctionSecurityHeaders
+    Export:
+      Name: !Sub '${AWS::StackName}-cloudfront-function-security-headers'
+
+  CodeBuildRole:
+    Value: !GetAtt CodeBuildRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-codebuild-role'
+
+  CodePipelineRole:
+    Value: !GetAtt CodePipelineRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-codepipeline-role'
+
+  FargateClusterName:
+    Description: Used by Django template
+    Value: !Ref FargateCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-fargate-cluster-name'
+
+  FargateService:
+    Value: !Ref FargateService
+    Export:
+      Name: !Sub '${AWS::StackName}-fargate-service'
+
+  ListenerHttps:
+    Value: !Ref ListenerHttps
+    Export:
+      Name: !Sub '${AWS::StackName}-listener-https'
+
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-fargate-service-load-balancer-dns-name'
+
+  LoadBalancer:
+    Description: Used by Django template
+    Value: !Ref LoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-fargate-service-load-balancer'
+
+  LoadBalancerHostedZoneId:
+    Description: Used by API template DNS records
+    Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${AWS::StackName}-fargate-service-load-balancer-hosted-zone-id'
+
+  VpcId:
+    Description: VPC ID of the VPC created in the network nested stack. Can't output directly from there
+    Value: !GetAtt NetworkStack.Outputs.VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-vpc-id'
